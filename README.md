@@ -12,17 +12,15 @@
 - 单个 SQLite3 bag、完成/失败标记、相对 SHA-256 清单和诊断证据。
 - 家用 Wi-Fi、手机热点和雷达有线链路的网络模板。
 
-## 使用前必须配置
+## Configuration
 
-公开版本故意没有任何真实 IP、磁盘 UUID、源码哈希、用户名或网络密码。部署前必须填写：
+本仓库使用占位符表示部署相关参数。将实际环境参数写入目标设备的本地配置，并将真实凭据限制在设备或受控的私有记录中。
 
 1. `pi_deployment/netplan/*.yaml` 中的 SSID、密码和雷达网段；
 2. `pi_deployment/bin/carrot-storage-guard` 的磁盘 UUID；
 3. `pi_deployment/bin/carrot-livox-verify` 的源码清单、配置和启动文件哈希；
 4. `pi_deployment/bin/carrot-bag`、`carrot-driver-launch` 和 `install.sh` 中的 Pi 用户及工作空间路径；
-5. 与你的 Mid-360S 配置匹配的 Livox 源码、配置文件和 ARM64 SDK。
-
-不要把真实 Wi-Fi 密码、SSH 私钥或访问令牌提交到 Git。
+5. 与目标 Mid-360S 配置匹配的 Livox 源码、配置文件和 ARM64 SDK。
 
 ## 常用命令
 
@@ -42,8 +40,10 @@ carrot-net status
 /mnt/carrot_disk/carrot_rosbags/<label>_<timestamp>/
 ```
 
-完整部署说明见 [`树莓派录包部署环境.md`](树莓派录包部署环境.md)。问题排查和验收建议见 `docs/`。
+软件版本和官方来源见 [`docs/SOFTWARE_STACK.md`](docs/SOFTWARE_STACK.md)。完整部署说明见 [`树莓派录包部署环境.md`](树莓派录包部署环境.md)，问题处理流程见 [`docs/PROBLEM-SOLVING.md`](docs/PROBLEM-SOLVING.md)。
 
-## 镜像
+## Artifact layout
 
-不要把 SD 卡原始镜像或 bag 文件提交到 Git 历史。建议在 GitHub Release、对象存储或实验室备份中保存镜像，并在发布说明中记录来源、制作日期、压缩格式和 SHA-256。
+Git history contains source code, scripts and documentation. Runtime bags and
+full-disk images are external artifacts; the image workflow and checksum record
+format are documented in [`docs/IMAGE_GUIDE.md`](docs/IMAGE_GUIDE.md).
