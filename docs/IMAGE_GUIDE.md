@@ -1,12 +1,42 @@
-# 系统镜像发布建议
+# SD image workflow
 
-Git 不适合保存几十 GiB 的 SD 卡镜像。建议：
+Full SD images are stored as release artifacts or in object storage rather than
+Git history. A published image record contains the OS version, architecture,
+creation date, compression format, byte size and SHA-256 checksum.
 
-1. 在 Pi 停止所有服务并安全卸载数据盘；
-2. 在确认的 SD 设备上生成压缩镜像；
-3. 使用 SHA-256 校验镜像；
-4. 将镜像上传 GitHub Release、对象存储或实验室备份；
-5. 在 Release 说明中记录 Ubuntu 版本、架构、制作日期、压缩格式、文件大小和 SHA-256；
-6. 不在仓库或 Release 中放 SSH 私钥、Wi-Fi 密码或访问令牌。
+## Create an image
 
-恢复镜像前必须按型号、容量、序列号再次确认目标 SD 设备。不要硬编码 `/dev/sda`，也不要在恢复时连接无关硬盘。
+Stop the recorder, stop the driver, unmount the data disk, and identify the SD
+whole-disk device with `lsblk`. The source device is read only during this
+operation; the destination must be a different filesystem with sufficient free
+space.
+
+```bash
+sudo sync
+sudo umount /mnt/carrot_disk
+lsblk -o NAME,MODEL,SERIAL,SIZE,FSTYPE,LABEL,MOUNTPOINTS
+sudo dd if=/dev/<confirmed-sd-device> of=/path/to/carrotpi-ubuntu-22.04.5.img \
+  bs=4M status=progress iflag=fullblock
+sync
+xz -T0 -z /path/to/carrotpi-ubuntu-22.04.5.img
+sha256sum /path/to/carrotpi-ubuntu-22.04.5.img.xz
+```
+
+The image includes the device's local machine identity, SSH host keys and any
+local network configuration present at capture time. Release metadata states
+whether those values were removed or regenerated.
+
+## Restore an image
+
+Identify the target SD whole-disk device by model, serial and capacity, then
+write the verified image:
+
+```bash
+sha256sum -c image.sha256
+xz -dc carrotpi-ubuntu-22.04.5.img.xz | \
+  sudo dd of=/dev/<confirmed-sd-device> bs=4M status=progress conv=fsync
+sync
+```
+
+Partition names and device paths are system-dependent; the examples use
+placeholders intentionally.
