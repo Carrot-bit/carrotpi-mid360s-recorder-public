@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+set +u
+
+ROS_SETUP=/opt/ros/humble/setup.bash
+WS_SETUP=/home/carrotuser/carrot_ws/install/setup.bash
+WATCHDOG=/usr/local/lib/carrot-recorder/topic_watchdog.py
+MOUNT_POINT=/mnt/carrot_disk
+BAG_ROOT=$MOUNT_POINT/carrot_rosbags
+EVIDENCE_ROOT=${XDG_STATE_HOME:-$HOME/.local/state}/carrot-recorder/runs
+CONTROL_ROOT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/carrot-recorder
+LOCK_FILE=$CONTROL_ROOT/recorder.lock
+STATE_FILE=$CONTROL_ROOT/state
+DRIVER_UNIT=carrot-driver.service
+LIDAR_TOPIC=/livox/lidar
+IMU_TOPIC=/livox/imu
+LIDAR_TYPE=livox_ros_driver2/msg/CustomMsg
+IMU_TYPE=sensor_msgs/msg/Imu
+
+ensure_dirs() { mkdir -p "$CONTROL_ROOT" "$EVIDENCE_ROOT"; }
+fail() { printf 'carrot-bag: %s\n' "$*" >&2; exit 1; }
+valid_label() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+monotonic_seconds() { awk '{print int($1)}' /proc/uptime; }
+state_get() { [[ -r "$STATE_FILE" ]] && sed -n "s/^$1=//p" "$STATE_FILE" | head -1; }
+write_state() {
+  local tmp="$STATE_FILE.$$"
+  { printf 'pid=%s\nphase=%s\nlabel=%s\noutput=%s\nlogs=%s\ndeadline=%s\n' "$BASHPID" "$1" "$LABEL" "${OUTPUT:-}" "${RUN_LOG:-}" "${DEADLINE:-0}"; } > "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+storage_guard() { /usr/local/bin/carrot-storage-guard >/dev/null; }
+runtime_storage_guard() { CARROT_MIN_FREE_KB=20971520 /usr/local/bin/carrot-storage-guard >/dev/null; }
+source_ros() { source "$ROS_SETUP"; source "$WS_SETUP"; export ROS_LOCALHOST_ONLY=1; }
+active_pid() { systemctl --user show -p MainPID --value "$1" 2>/dev/null || true; }
+check_health() {
+  local temp=unknown throttle=unknown
+  [[ -r /sys/class/thermal/thermal_zone0/temp ]] && temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+  command -v vcgencmd >/dev/null 2>&1 && throttle=$(vcgencmd get_throttled 2>/dev/null | sed 's/.*=//')
+  printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$temp" "$throttle" "$(cat /proc/loadavg)" >> "$RUN_LOG/health.tsv"
+  [[ "$temp" == unknown || "$temp" =~ ^[0-9]+$ ]] || return 1
+  [[ "$temp" == unknown || "$temp" -lt 80000 ]] || return 1
+  [[ "$throttle" == unknown || "$throttle" == 0x0 ]] || return 1
+}
+capture_evidence() {
+  { ip -s link show dev eth0; free -h; dmesg -T | tail -200; tail -200 /var/log/kern.log; } > "$RUN_LOG/system_snapshot.txt" 2>&1 || true
+}
+preserve_failed_run() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )) && [[ -n "${OUTPUT:-}" && -n "${RUN_LOG:-}" ]]; then
+    capture_evidence
+    mkdir -p "$OUTPUT" 2>/dev/null || true
+    [[ -e "$OUTPUT/COMPLETE" ]] || touch "$OUTPUT/FAILED" 2>/dev/null || true
+    cp -f "$RUN_LOG"/* "$OUTPUT/" 2>/dev/null || true
+    rm -f "$STATE_FILE"
+  fi
+  exit "$rc"
+}
+check_kernel_errors() {
+  [[ -r "${KERNEL_LOG:-}" ]] || return 0
+  local first_line=$((KERNEL_LOG_LINES + 1))
+  tail -n "+$first_line" "$KERNEL_LOG" 2>/dev/null | \
+    grep -Eiq '(usb .*reset|uas.*error|ntfs.*(error|fail)|i/o error|buffer i/o)' && return 1
+  KERNEL_LOG_LINES=$(wc -l < "$KERNEL_LOG")
+}
+verify_completed_bag() {
+  ros2 bag info "$OUTPUT" > "$RUN_LOG/bag_info.txt" 2>&1
+  cp -f "$OUTPUT/metadata.yaml" "$RUN_LOG/bag_info.yaml"
+  python3 /usr/local/lib/carrot-recorder/verify_bag.py "$RUN_LOG/bag_info.yaml" > "$RUN_LOG/bag_verification.txt"
+}
+
+usage() { printf '%s\n' \
+  'carrot-bag start LABEL [minutes]' 'carrot-bag run LABEL (systemd internal)' \
+  'carrot-bag watch LABEL' 'carrot-bag extend LABEL' 'carrot-bag stop' \
+  'carrot-bag status' 'carrot-bag logs LABEL' 'carrot-bag driver-stop'; }
+
+cmd=${1:-help}; LABEL=${2:-}; MINUTES=${3:-60}
+case "$cmd" in
+  start)
+    valid_label "$LABEL" || fail 'label must match [A-Za-z0-9][A-Za-z0-9._-]*'
+    [[ "$MINUTES" =~ ^[1-9][0-9]*$ && "$MINUTES" -le 60 ]] || fail 'minutes must be 1..60'
+    ensure_dirs
+    if [[ -r "$STATE_FILE" ]]; then
+      active_label=$(state_get label)
+      if [[ -n "$active_label" ]] && systemctl --user is-active --quiet "carrot-bag@${active_label}.service"; then
+        fail "a recording is already active: $(state_get output)"
+      fi
+      rm -f "$STATE_FILE"
+    fi
+    rm -f "$CONTROL_ROOT/stop" "$CONTROL_ROOT/extend"
+    printf '%s\n' "$MINUTES" > "$CONTROL_ROOT/duration.${LABEL}"
+    if ! systemctl --user start "carrot-bag@${LABEL}.service"; then
+      rm -f "$CONTROL_ROOT/duration.${LABEL}"
+      fail 'systemd failed to start the recorder'
+    fi
+    printf 'started %s; use carrot-bag watch %s\n' "$LABEL" "$LABEL" ;;
+  run)
+    ensure_dirs
+    valid_label "$LABEL" || exit 2
+    duration_file="$CONTROL_ROOT/duration.${LABEL}"
+    if [[ -r "$duration_file" ]]; then
+      MINUTES=$(<"$duration_file")
+      rm -f "$duration_file"
+    else
+      MINUTES=60
+    fi
+    [[ "$MINUTES" =~ ^[1-9][0-9]*$ && "$MINUTES" -le 60 ]] || fail 'invalid requested duration'
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || fail 'another recorder is active'
+    rm -f "$CONTROL_ROOT/stop" "$CONTROL_ROOT/extend"
+    source_ros
+    storage_guard
+    /usr/local/bin/carrot-livox-verify
+    mkdir -p "$BAG_ROOT" "$EVIDENCE_ROOT"
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    OUTPUT="$BAG_ROOT/${LABEL}_${TIMESTAMP}"
+    RUN_LOG="$EVIDENCE_ROOT/${LABEL}_${TIMESTAMP}"
+    mkdir -p "$RUN_LOG"
+    [[ ! -e "$OUTPUT" ]] || fail "refusing to overwrite $OUTPUT"
+    trap preserve_failed_run EXIT
+    printf 'label=%s\nstarted=%s\n' "$LABEL" "$(date -Is)" > "$RUN_LOG/session.txt"
+    if ! systemctl --user is-active --quiet "$DRIVER_UNIT"; then
+      existing_lidar=$(timeout 3 ros2 topic type "$LIDAR_TOPIC" 2>/dev/null || true)
+      existing_imu=$(timeout 3 ros2 topic type "$IMU_TOPIC" 2>/dev/null || true)
+      [[ -z "$existing_lidar" && -z "$existing_imu" ]] || fail 'unmanaged Livox topics already exist; stop them before recording'
+      systemctl --user start "$DRIVER_UNIT"
+      DRIVER_STARTED=1
+    else
+      DRIVER_STARTED=0
+    fi
+    ready=0
+    for _ in $(seq 1 35); do
+      lt=$(timeout 3 ros2 topic type "$LIDAR_TOPIC" 2>/dev/null || true)
+      it=$(timeout 3 ros2 topic type "$IMU_TOPIC" 2>/dev/null || true)
+      if [[ "$lt" == "$LIDAR_TYPE" && "$it" == "$IMU_TYPE" ]]; then ready=1; break; fi
+      sleep 1
+    done
+    (( ready == 1 )) || { printf 'topic readiness failed\n' >> "$RUN_LOG/session.txt"; exit 1; }
+    printf '[topic types]\n%s\n%s\n' "$lt" "$it" > "$RUN_LOG/topic_types.txt"
+    timeout 12 ros2 topic echo "$LIDAR_TOPIC" --once --no-arr >/dev/null 2>&1 || fail 'no live LiDAR message'
+    timeout 12 ros2 topic echo "$IMU_TOPIC" --once >/dev/null 2>&1 || fail 'no live IMU message'
+    lidar_rate=$(timeout 9 ros2 topic hz "$LIDAR_TOPIC" 2>&1 | awk '/average rate:/{print $3; exit}' || true)
+    imu_rate=$(timeout 9 ros2 topic hz "$IMU_TOPIC" 2>&1 | awk '/average rate:/{print $3; exit}' || true)
+    awk -v x="${lidar_rate:-0}" 'BEGIN {exit !(x >= 8 && x <= 12)}' || fail "LiDAR rate out of range: ${lidar_rate:-unknown}"
+    awk -v x="${imu_rate:-0}" 'BEGIN {exit !(x >= 160 && x <= 240)}' || fail "IMU rate out of range: ${imu_rate:-unknown}"
+    write_state recording
+    setsid ros2 bag record --storage sqlite3 --max-cache-size 33554432 -o "$OUTPUT" "$LIDAR_TOPIC" "$IMU_TOPIC" >"$RUN_LOG/recorder.log" 2>&1 &
+    REC_PID=$!
+    recorder_ready=0
+    for _ in $(seq 1 12); do
+      if grep -q 'Recording' "$RUN_LOG/recorder.log" 2>/dev/null; then recorder_ready=1; break; fi
+      kill -0 "$REC_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if (( recorder_ready == 0 )); then
+      printf 'recorder did not become ready\n' >> "$RUN_LOG/session.txt"
+      kill -INT -- "-$REC_PID" 2>/dev/null || kill -INT "$REC_PID" 2>/dev/null || true
+      wait "$REC_PID" 2>/dev/null || true
+      mkdir -p "$OUTPUT"
+      touch "$OUTPUT/FAILED"
+      cp -f "$RUN_LOG"/* "$OUTPUT/" 2>/dev/null || true
+      rm -f "$STATE_FILE"
+      exit 1
+    fi
+    setsid python3 "$WATCHDOG" --heartbeat "$RUN_LOG/watchdog.tsv" --interface eth0 >"$RUN_LOG/watchdog.log" 2>&1 &
+    WD_PID=$!
+    START_MONO=$(monotonic_seconds); DEADLINE=$((START_MONO + MINUTES * 60)); write_state recording
+    printf 'timestamp\tcpu_temp_millic\tthrottled\tloadavg\n' > "$RUN_LOG/health.tsv"
+    KERNEL_LOG=/var/log/kern.log; KERNEL_LOG_LINES=0
+    [[ -r "$KERNEL_LOG" ]] && KERNEL_LOG_LINES=$(wc -l < "$KERNEL_LOG")
+    stop_reason=operator; abnormal=0; expected_stop=0; last_size=0; stagnant=0; prompt_count=0; STOP_NOW=0; last_rx_dropped=-1; last_rx_errors=-1
+    trap 'stop_reason=signal; abnormal=1; STOP_NOW=1' INT TERM HUP
+    while kill -0 "$REC_PID" 2>/dev/null && (( STOP_NOW == 0 )); do
+      now=$(monotonic_seconds)
+      [[ -e "$CONTROL_ROOT/stop" ]] && { rm -f "$CONTROL_ROOT/stop"; stop_reason=operator; expected_stop=1; break; }
+      if [[ -e "$CONTROL_ROOT/extend" ]]; then rm -f "$CONTROL_ROOT/extend"; DEADLINE=$((now + 3600)); write_state recording; fi
+      runtime_storage_guard >/dev/null 2>>"$RUN_LOG/storage.log" || { stop_reason=storage_failure; abnormal=1; break; }
+      check_health || { stop_reason=thermal_or_power; abnormal=1; break; }
+      check_kernel_errors || { stop_reason=kernel_io_error; abnormal=1; break; }
+      latest=$(find "$OUTPUT" -maxdepth 1 -name '*.db3' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+      if (( latest <= last_size )); then stagnant=$((stagnant + 1)); else stagnant=0; last_size=$latest; fi
+      (( stagnant < 3 )) || { stop_reason=write_stall; abnormal=1; break; }
+      hb=$(tail -n 1 "$RUN_LOG/watchdog.tsv" 2>/dev/null || true)
+      heartbeat_epoch_ms=$(awk '{print $1}' <<< "$hb")
+      lidar_age=$(awk '{print $2}' <<< "$hb")
+      imu_age=$(awk '{print $3}' <<< "$hb")
+      carrier=$(awk '{print $4}' <<< "$hb")
+      rx_dropped=$(awk '{print $7}' <<< "$hb")
+      rx_errors=$(awk '{print $8}' <<< "$hb")
+      kill -0 "$WD_PID" 2>/dev/null || { stop_reason=watchdog_exited; abnormal=1; break; }
+      if [[ "$heartbeat_epoch_ms" =~ ^[0-9]+$ ]]; then
+        now_epoch_ms=$(date +%s%3N)
+        (( now_epoch_ms - heartbeat_epoch_ms <= 3000 )) || { stop_reason=watchdog_stall; abnormal=1; break; }
+      fi
+      [[ "$carrier" != 0 ]] || { stop_reason=carrier_down; abnormal=1; break; }
+      [[ ! "$lidar_age" =~ ^[0-9]+$ || "$lidar_age" -le 3000 ]] || { stop_reason=lidar_stall; abnormal=1; break; }
+      [[ ! "$imu_age" =~ ^[0-9]+$ || "$imu_age" -le 3000 ]] || { stop_reason=imu_stall; abnormal=1; break; }
+      if [[ "$rx_dropped" =~ ^[0-9]+$ && "$rx_errors" =~ ^[0-9]+$ ]]; then
+        (( last_rx_dropped < 0 || (rx_dropped == last_rx_dropped && rx_errors == last_rx_errors) )) || { stop_reason=eth0_rx_error; abnormal=1; break; }
+        last_rx_dropped=$rx_dropped; last_rx_errors=$rx_errors
+      fi
+      if (( now >= DEADLINE )); then
+        write_state prompt
+        prompt_count=$((prompt_count + 1))
+        prompt_deadline=$((now + 30))
+        while (( $(monotonic_seconds) < prompt_deadline )); do
+          [[ -e "$CONTROL_ROOT/extend" ]] && { rm -f "$CONTROL_ROOT/extend"; DEADLINE=$(( $(monotonic_seconds) + 3600 )); write_state recording; break; }
+          [[ -e "$CONTROL_ROOT/stop" ]] && { rm -f "$CONTROL_ROOT/stop"; stop_reason=operator; expected_stop=1; break 2; }
+          sleep 1
+        done
+        (( $(monotonic_seconds) < DEADLINE )) || { stop_reason=timeout; expected_stop=1; break; }
+      fi
+      sleep 10
+    done
+    if [[ -n "${WD_PID:-}" ]]; then
+      kill -TERM "$WD_PID" 2>/dev/null || true
+      wait "$WD_PID" 2>/dev/null || true
+    fi
+    if ! kill -0 "$REC_PID" 2>/dev/null && (( abnormal == 0 && expected_stop == 0 )); then
+      stop_reason=recorder_exited; abnormal=1
+    fi
+    if kill -0 "$REC_PID" 2>/dev/null; then kill -INT -- "-$REC_PID" 2>/dev/null || kill -INT "$REC_PID" 2>/dev/null || true; fi
+    for _ in $(seq 1 30); do kill -0 "$REC_PID" 2>/dev/null || break; sleep 1; done
+    kill -TERM -- "-$REC_PID" 2>/dev/null || true
+    for _ in $(seq 1 10); do kill -0 "$REC_PID" 2>/dev/null || break; sleep 1; done
+    kill -KILL -- "-$REC_PID" 2>/dev/null || true
+    wait "$REC_PID" 2>/dev/null || true
+    printf 'stop_reason=%s\nfinished=%s\n' "$stop_reason" "$(date -Is)" >> "$RUN_LOG/session.txt"
+    (( abnormal == 0 )) || capture_evidence
+    if [[ -f "$OUTPUT/metadata.yaml" ]] && compgen -G "$OUTPUT/*.db3" >/dev/null; then
+      source_ros
+      verify_completed_bag || abnormal=1
+      (cd "$OUTPUT" && sha256sum -- *.db3 metadata.yaml) > "$OUTPUT/bag_files.sha256" || abnormal=1
+      cp -f "$RUN_LOG"/* "$OUTPUT/" 2>/dev/null || true
+      sync
+      (( abnormal == 0 )) && touch "$OUTPUT/COMPLETE"
+    else
+      abnormal=1; touch "$OUTPUT/FAILED"
+    fi
+    (( abnormal == 0 )) || touch "$OUTPUT/FAILED"
+    rm -f "$STATE_FILE"
+    (( abnormal == 0 )) || exit 1
+    ;;
+  stop)
+    ensure_dirs
+    [[ -r "$STATE_FILE" ]] || fail 'no active recording'
+    touch "$CONTROL_ROOT/stop"
+    printf 'safe stop requested\n' ;;
+  extend)
+    ensure_dirs
+    [[ -r "$STATE_FILE" ]] || fail 'no active recording'
+    touch "$CONTROL_ROOT/extend"; printf 'requested another 60 minutes\n' ;;
+  watch)
+    ensure_dirs
+    valid_label "$LABEL" || fail 'invalid label'
+    trap 'touch "$CONTROL_ROOT/stop"; exit 130' INT
+    while systemctl --user is-active --quiet "carrot-bag@${LABEL}.service"; do
+      if [[ "$(state_get phase)" == prompt ]]; then
+        printf '\n60-minute limit reached. Extend another 60 minutes? [y/N] '
+        answer=n
+        if read -r -t 30 answer; then :; fi
+        case "${answer,,}" in
+          y|yes)
+            touch "$CONTROL_ROOT/extend"
+            printf 'extension requested\n'
+            # The supervisor polls the request once per second. Wait for its
+            # acknowledgement so this monitor cannot show the same prompt
+            # twice before phase returns to recording.
+            for _ in $(seq 1 25); do
+              [[ "$(state_get phase)" != prompt ]] && break
+              systemctl --user is-active --quiet "carrot-bag@${LABEL}.service" || break
+              sleep 0.2
+            done ;;
+          *)
+            touch "$CONTROL_ROOT/stop"
+            printf 'safe stop requested; waiting for recorder flush\n'
+            for _ in $(seq 1 180); do
+              systemctl --user is-active --quiet "carrot-bag@${LABEL}.service" || {
+                printf 'recording stopped\n'
+                exit 0
+              }
+              sleep 1
+            done
+            fail 'recorder did not stop within 180 seconds' ;;
+        esac
+      else
+        printf '\rphase=%s output=%s deadline=%s  Ctrl+C=stop' "$(state_get phase)" "$(state_get output)" "$(state_get deadline)"
+        sleep 2
+      fi
+    done
+    printf '\nrecording stopped\n' ;;
+  status)
+    [[ -r "$STATE_FILE" ]] && cat "$STATE_FILE" || echo 'no active recording' ;;
+  logs)
+    journalctl --user -u "carrot-bag@${LABEL}.service" -f ;;
+  driver-stop)
+    if [[ -r "$STATE_FILE" ]]; then
+      active_label=$(state_get label)
+      touch "$CONTROL_ROOT/stop"
+      for _ in $(seq 1 90); do
+        systemctl --user is-active --quiet "carrot-bag@${active_label}.service" || break
+        sleep 2
+      done
+      systemctl --user is-active --quiet "carrot-bag@${active_label}.service" && fail 'recorder did not stop safely; driver left running'
+    fi
+    systemctl --user stop "$DRIVER_UNIT" ;;
+  *) usage; exit 2 ;;
+esac

@@ -1,0 +1,30 @@
+# Runtime data and recordings
+*.db3
+*.bag
+*.mcap
+*.log
+*.tsv
+bag_files.sha256
+COMPLETE
+FAILED
+
+# Images and archives
+*.img
+*.img.xz
+*.img.gz
+*.iso
+*.raw
+
+# Secrets and local configuration
+*.pem
+*.key
+id_ed25519
+id_ed25519.pub
+known_hosts
+*.secret
+*.env
+__pycache__/
+.ros/
+build/
+install/
+log/

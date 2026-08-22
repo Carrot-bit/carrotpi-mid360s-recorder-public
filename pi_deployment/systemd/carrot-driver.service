@@ -1,0 +1,13 @@
+[Unit]
+Description=Carrot Mid-360S Livox driver
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=ROS_LOCALHOST_ONLY=1
+ExecStart=/usr/local/bin/carrot-driver-launch
+Restart=no
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]

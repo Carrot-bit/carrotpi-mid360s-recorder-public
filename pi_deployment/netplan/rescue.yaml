@@ -1,0 +1,11 @@
+# carrot-profile: rescue
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    eth0:
+      addresses: [REPLACE_RESCUE_PI_IP/24]
+      dhcp4: false
+      dhcp6: false
+      optional: true
+  wifis: {}

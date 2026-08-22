@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Public template: configure these values locally, or replace this verifier
+# with a private, measured source manifest before using it for acquisition.
+PI_USER=${CARROT_PI_USER:-${SUDO_USER:-carrotuser}}
+ROOT=${CARROT_LIVOX_ROOT:-/home/$PI_USER/carrot_ws/src/livox_ros_driver2}
+MANIFEST=${CARROT_LIVOX_MANIFEST:-/usr/local/share/carrot-recorder/livox_ros_driver2.files.sha256}
+CONFIG_SHA256=${CARROT_CONFIG_SHA256:-}
+LAUNCH_SHA256=${CARROT_LAUNCH_SHA256:-}
+
+fail() { printf 'carrot-livox-verify: %s\n' "$*" >&2; exit 1; }
+[[ -d "$ROOT" && -r "$MANIFEST" ]] || fail 'configure a local Livox source tree and manifest'
+( cd "$(dirname "$(dirname "$ROOT")")" && sha256sum -c "$MANIFEST" ) || fail 'Livox source manifest check failed'
+[[ -n "$CONFIG_SHA256" && -n "$LAUNCH_SHA256" ]] || fail 'configure CARROT_CONFIG_SHA256 and CARROT_LAUNCH_SHA256'
+[[ $(sha256sum "$ROOT/config/MID360s_config.json" | awk '{print $1}') == "$CONFIG_SHA256" ]] || fail 'MID360s_config.json checksum mismatch'
+[[ $(sha256sum "$ROOT/launch_ROS2/msg_MID360s_launch.py" | awk '{print $1}') == "$LAUNCH_SHA256" ]] || fail 'msg_MID360s_launch.py checksum mismatch'

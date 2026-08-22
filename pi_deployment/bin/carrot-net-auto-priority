@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ACTIVE=${CARROT_NET_ACTIVE:-/etc/netplan/99-carrot.yaml}
+CONNECTIONS=${CARROT_NM_CONNECTIONS:-/run/NetworkManager/system-connections}
+
+[[ -r "$ACTIVE" ]] || exit 0
+grep -qx '# carrot-profile: auto' "$ACTIVE" || exit 0
+hotspot=$(sed -n 's/^# carrot-hotspot-ssid: //p' "$ACTIVE")
+[[ -n "$hotspot" ]] || { echo 'auto network profile has no hotspot marker' >&2; exit 1; }
+
+found=0
+for profile in "$CONNECTIONS"/netplan-wlan0-*.nmconnection; do
+  [[ -f "$profile" ]] || continue
+  ssid=$(sed -n 's/^ssid=//p' "$profile" | head -1)
+  [[ -n "$ssid" ]] || continue
+  priority=10
+  [[ "$ssid" == "$hotspot" ]] && priority=100
+  temporary=$(mktemp "${profile}.XXXXXX")
+  awk -v priority="$priority" '
+    BEGIN { in_connection = 0; wrote = 0 }
+    $0 == "[connection]" { in_connection = 1 }
+    in_connection && /^autoconnect-priority=/ {
+      print "autoconnect-priority=" priority
+      wrote = 1
+      next
+    }
+    in_connection && /^\[/ && $0 != "[connection]" {
+      if (!wrote) print "autoconnect-priority=" priority
+      in_connection = 0
+      wrote = 1
+    }
+    { print }
+    END { if (in_connection && !wrote) print "autoconnect-priority=" priority }
+  ' "$profile" > "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$profile"
+  found=$((found + 1))
+done
+
+(( found == 2 )) || {
+  echo "auto network profile: expected 2 generated Wi-Fi connections, found $found" >&2
+  exit 1
+}

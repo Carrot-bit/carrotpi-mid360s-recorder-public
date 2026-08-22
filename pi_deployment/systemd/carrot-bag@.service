@@ -1,0 +1,16 @@
+[Unit]
+Description=Carrot Mid-360S bag recorder (%i)
+
+[Service]
+Type=exec
+Environment=ROS_LOCALHOST_ONLY=1
+ExecStartPre=/usr/local/bin/carrot-storage-guard
+ExecStart=/usr/local/bin/carrot-bag run %i
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30min
+SendSIGKILL=yes
+Restart=no
+UMask=0022
+
+[Install]

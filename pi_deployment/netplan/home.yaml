@@ -1,0 +1,13 @@
+# carrot-profile: home
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    eth0: {dhcp4: false, dhcp6: false, optional: true}
+  wifis:
+    wlan0:
+      dhcp4: true
+      dhcp6: false
+      optional: true
+      access-points:
+        "REPLACE_HOME_SSID": {password: "REPLACE_HOME_PASSWORD"}

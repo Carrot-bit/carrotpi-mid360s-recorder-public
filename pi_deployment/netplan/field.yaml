@@ -1,0 +1,17 @@
+# carrot-profile: field
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    eth0:
+      addresses: [REPLACE_PI_ETH_IP/24]
+      dhcp4: false
+      dhcp6: false
+      optional: true
+  wifis:
+    wlan0:
+      dhcp4: true
+      dhcp6: false
+      optional: true
+      access-points:
+        "REPLACE_PHONE_HOTSPOT_SSID": {password: "REPLACE_PHONE_HOTSPOT_PASSWORD"}

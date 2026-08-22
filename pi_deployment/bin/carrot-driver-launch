@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+/usr/local/bin/carrot-livox-verify
+set +u
+source /opt/ros/humble/setup.bash
+source /home/carrotuser/carrot_ws/install/setup.bash
+set -u
+exec ros2 launch livox_ros_driver2 msg_MID360s_launch.py

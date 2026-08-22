@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNT_POINT=${CARROT_MOUNT_POINT:-/mnt/carrot_disk}
+BAG_ROOT=${CARROT_BAG_ROOT:-$MOUNT_POINT/carrot_rosbags}
+EXPECTED_UUID=${CARROT_DISK_UUID:-REPLACE_NTFS_UUID}
+MIN_FREE_KB=${CARROT_MIN_FREE_KB:-41943040}
+fail() { printf 'storage-guard: %s\n' "$*" >&2; exit 1; }
+
+mkdir -p "$MOUNT_POINT"
+# Resolving a child of the path crosses the systemd automount point. Merely
+# stating the mount point itself leaves the automount waiting and looks absent.
+timeout 15 stat "$MOUNT_POINT/." >/dev/null 2>&1 || fail "cannot access $MOUNT_POINT"
+# systemd's automount remains visible underneath the real filesystem on Jammy.
+# Restrict the query to the only two accepted NTFS driver types so the autofs
+# layer cannot contribute an empty UUID record.
+mount_record=$(findmnt -nro SOURCE,UUID,FSTYPE,OPTIONS \
+  -t fuseblk,ntfs3 -T "$MOUNT_POINT/." 2>/dev/null || true)
+read -r source uuid fstype options <<< "$mount_record" || true
+[[ -n "$source" && -n "$uuid" ]] || fail "disk is not mounted at $MOUNT_POINT"
+[[ "${uuid^^}" == "${EXPECTED_UUID^^}" ]] || fail "UUID mismatch: got ${uuid:-none}, expected $EXPECTED_UUID"
+[[ "$fstype" == ntfs3 || "$fstype" == fuseblk ]] || fail "unexpected filesystem: $fstype"
+[[ ",$options," == *,rw,* ]] || fail "disk is read-only"
+[[ -d "$MOUNT_POINT" && ! -L "$MOUNT_POINT" ]] || fail "mount point is invalid"
+
+mkdir -p "$BAG_ROOT"
+[[ -d "$BAG_ROOT" && ! -L "$BAG_ROOT" ]] || fail "bag root is invalid"
+root_source=$(findmnt -nro SOURCE -t fuseblk,ntfs3 -T "$BAG_ROOT/." 2>/dev/null || true)
+[[ "$root_source" == "$source" ]] || fail "bag root is not on validated disk"
+probe="$BAG_ROOT/.carrot-write-probe.$$"
+printf '%s\n' "$(date -Is)" > "$probe" || fail "write probe failed"
+rm -f "$probe"
+free_kb=$(df -Pk "$BAG_ROOT" | awk 'NR==2 {print $4}')
+[[ "$free_kb" =~ ^[0-9]+$ ]] || fail "cannot read free space"
+(( free_kb >= MIN_FREE_KB )) || fail "only ${free_kb} KiB free; need ${MIN_FREE_KB} KiB"
+printf 'source=%s\nuuid=%s\nfstype=%s\nmount=%s\nbag_root=%s\nfree_kb=%s\n' \
+  "$source" "$uuid" "$fstype" "$MOUNT_POINT" "$BAG_ROOT" "$free_kb"
