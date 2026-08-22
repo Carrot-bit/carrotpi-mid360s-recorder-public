@@ -1,25 +1,67 @@
-# 部署问题与解决方法（脱敏版）
+# Deployment troubleshooting
 
-## 写卡
+## Writing the SD card
 
-Ubuntu 启动 U 盘不能作为 Raspberry Pi 的 x86 启动盘。写卡前物理拔下无关 U 盘和外接硬盘，只保留确认过型号、容量和序列号的 SD 卡；镜像必须来自官方 ARM64 Raspberry Pi Ubuntu 22.04 发布页并校验 SHA-256。
+The Raspberry Pi requires a 64-bit ARM image. A normal x86/amd64 Ubuntu USB
+drive boots a laptop and is not a Raspberry Pi boot medium. Before writing,
+disconnect unrelated USB storage and identify the target SD whole-disk device
+by model, serial and capacity. Verify the official image checksum before
+writing it.
 
-## 无头网络
+## Headless networking
 
-`.local` 名称发现依赖 Avahi，可能在启动较慢或网络尚未建立时暂时不可用。应使用路由器/DHCP 客户端列表或当前 DHCP 地址，不猜测地址。雷达有线网段不能与 Wi-Fi 网段重叠。
+`.local` discovery is provided by Avahi and may be unavailable while the network
+is still starting. The router/DHCP client list and `ip -br addr` provide the
+authoritative address. The radar Ethernet subnet must differ from every Wi-Fi
+subnet. `eth0` carries radar UDP traffic; `wlan0` carries SSH and the default
+route.
 
-## ROS 工具包
+## ROS package installation
 
-Ubuntu 的 ROS 相关包需要启用 `universe` 并刷新 APT 索引。`ros2 --version` 不是 Humble CLI 支持的参数；用 `printenv ROS_DISTRO`、`ros2 pkg list` 和 `colcon version-check` 验证。
+Ubuntu 22.04 requires the `universe` component for several development tools.
+After enabling it, refresh APT and install the ROS 2 Humble packages listed in
+[`SOFTWARE_STACK.md`](SOFTWARE_STACK.md). `ros2 --version` is not a supported
+Humble CLI invocation; use `printenv ROS_DISTRO`, `ros2 pkg list` and
+`colcon version-check` for validation.
 
-## ARM64 编译
+## ARM64 compilation
 
-Livox SDK 和 ROS 驱动必须在 Pi 上原生编译，不能复制笔记本的 x86-64 库。低内存 Pi 编译时可临时启用交换空间，并使用低并行度；编译卡住时先确认 CPU/内存/进程状态，不要立即断电。
+Livox SDK and ROS driver binaries are architecture-specific. Build both on the
+Pi with the ARM64 compiler. Low-memory boards can use a temporary swap file and
+low parallelism (`-j2`). During a slow build, inspect `free -h`, `ps` and CPU
+activity before interrupting the compiler.
 
-## 外接盘保护
+## NTFS data storage
 
-`findmnt --verify` 对 `ntfs-3g` 的用户态类型名可能给出静态比较警告。只要实际挂载的 UUID 正确、文件系统为 `fuseblk`/`ntfs3`、选项为 `rw` 且存储守卫通过，就不要运行 `ntfsfix`、格式化或修复命令。
+`findmnt --verify` can report a type-name warning for the `ntfs-3g` userspace
+driver. The runtime checks are the mounted UUID, actual filesystem type
+(`fuseblk` or `ntfs3`), read/write state, write probe and free-space result.
+The storage guard rejects a missing, read-only or mismatched disk. Volume repair
+tools are outside this deployment workflow.
 
-## 录包
+## Recording validation
 
-录包服务拒绝并发、错误磁盘、错误驱动、无消息、频率越界和空间不足。异常会保留原目录并写 `FAILED` 与证据，不覆盖、删除或续录已有目录。正式使用前应完成短测、稳定性测试和完整压力测试。
+Run the following sequence after the driver and disk are configured:
+
+```bash
+carrot-storage-guard
+carrot-bag start smoke 1
+carrot-bag status
+carrot-bag stop
+```
+
+Inspect `metadata.yaml`, the `.db3` file, `bag_files.sha256`, `bag_info.txt` and
+the `COMPLETE`/`FAILED` marker. The recorder rejects concurrent sessions,
+incorrect topic types, missing messages, out-of-range frequencies, low disk
+space and health failures. Abnormal sessions retain their original directory
+and evidence; existing sessions are never overwritten or resumed.
+
+## Common service checks
+
+```bash
+systemctl --user is-active carrot-driver.service
+journalctl --user -u carrot-driver.service -n 50
+carrot-bag logs <label>
+vcgencmd get_throttled
+df -h /mnt/carrot_disk
+```
