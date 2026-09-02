@@ -1,7 +1,7 @@
 [Unit]
 Description=Set Carrot auto Wi-Fi connection priorities
 Wants=NetworkManager.service
-Before=NetworkManager.service
+After=NetworkManager.service
 
 [Service]
 Type=oneshot
