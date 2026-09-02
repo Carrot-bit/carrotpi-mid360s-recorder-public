@@ -42,6 +42,11 @@ sudo carrot-net add-fallback "SSID"
 /mnt/carrot_disk/carrot_rosbags/<label>_<timestamp>/
 ```
 
+每次录制自动将 recorder、watchdog、健康、存储、会话和校验日志写入状态目录，
+并在停止后复制到对应 bag 目录。最终摘要显示停止原因、时长、bag 大小、话题
+统计、完整性/SHA-256 校验和日志位置。SSH 意外断开不停止后台录制；重新连接后
+使用 `watch`，服务若已结束则显示该 label 最新一次录制的静态摘要。
+
 软件版本和官方来源见 [`docs/SOFTWARE_STACK.md`](docs/SOFTWARE_STACK.md)。完整部署说明见 [`树莓派录包部署环境.md`](树莓派录包部署环境.md)，问题处理流程见 [`docs/PROBLEM-SOLVING.md`](docs/PROBLEM-SOLVING.md)。
 
 ## Artifact layout

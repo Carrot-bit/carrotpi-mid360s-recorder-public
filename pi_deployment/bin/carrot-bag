@@ -116,6 +116,70 @@ phase_text() {
   esac
 }
 
+latest_output_for_label() {
+  local label=$1
+  find "$BAG_ROOT" -mindepth 1 -maxdepth 1 -type d -name "${label}_*" \
+    -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
+}
+
+print_run_summary() {
+  local output=$1 mode=${2:-finished} result verification reason recorded_seconds
+  local bag_bytes bag_size checksum topics evidence_dir
+  [[ -d "$output" ]] || return 1
+  if [[ -e "$output/COMPLETE" && ! -e "$output/FAILED" ]]; then
+    result=COMPLETE; verification=通过
+  else
+    result=FAILED; verification=失败
+  fi
+  reason=$(sed -n 's/^stop_reason=//p' "$output/session.txt" 2>/dev/null | tail -1)
+  [[ -n "$reason" ]] || reason=unknown
+  recorded_seconds=$(sed -n 's/^recorded_seconds=//p' "$output/session.txt" 2>/dev/null | tail -1)
+  [[ "$recorded_seconds" =~ ^[0-9]+$ ]] || recorded_seconds=0
+  bag_bytes=$(find "$output" -maxdepth 1 -type f -name '*.db3' -printf '%s\n' 2>/dev/null \
+    | awk '{sum += $1} END {printf "%.0f", sum}')
+  bag_size=$(format_bytes "$bag_bytes")
+  checksum=未执行
+  if [[ -f "$output/bag_files.sha256" ]]; then
+    if (cd "$output" && sha256sum -c bag_files.sha256 >/dev/null 2>&1); then
+      checksum=通过
+    else
+      checksum=失败
+      verification=失败
+      result=FAILED
+    fi
+  fi
+  topics=$(grep -E '^/livox/(lidar|imu):' "$output/bag_verification.txt" 2>/dev/null \
+    | awk 'BEGIN { separator = "" } { printf "%s%s", separator, $0; separator = " | " }')
+  [[ -n "$topics" ]] || topics=未生成
+  evidence_dir=${output/$BAG_ROOT/$EVIDENCE_ROOT}
+  printf '%s\n' "录制摘要（${mode}）" \
+    "结果：$result" \
+    "停止原因：$reason" \
+    "路径：$output" \
+    "累计时长：$(format_duration "$recorded_seconds")" \
+    "bag 大小：$bag_size" \
+    "话题：$topics" \
+    "完整性校验：$verification；SHA-256：$checksum" \
+    "运行日志：$evidence_dir"
+  [[ "$result" == COMPLETE ]]
+}
+
+print_service_failure_summary() {
+  local unit=$1 label=$2 result exit_status
+  result=$(systemctl --user show -p Result --value "$unit" 2>/dev/null || true)
+  exit_status=$(systemctl --user show -p ExecMainStatus --value "$unit" 2>/dev/null || true)
+  [[ -n "$result" ]] || result=unknown
+  [[ -n "$exit_status" ]] || exit_status=unknown
+  printf '%s\n' '录制摘要（启动或前台异常结束）' \
+    '结果：FAILED' \
+    "任务：$label" \
+    "systemd：Result=$result，ExecMainStatus=$exit_status" \
+    '输出目录：未创建或状态不可用' \
+    "日志：carrot-bag logs $label"
+  journalctl --user -u "$unit" -n 8 --no-pager 2>/dev/null || true
+  return 1
+}
+
 monitor_recording() {
   local monitor_label=$1
   local unit="carrot-bag@${monitor_label}.service"
@@ -155,8 +219,13 @@ monitor_recording() {
   while :; do
     if (( monitor_detach == 1 )); then
       clear_monitor_display
+      output_now=$(state_get output 2>/dev/null || true)
+      printf '前台界面已退出，后台录制仍在继续。\n'
+      printf '状态：%s\n' "$(phase_text "$(state_get phase 2>/dev/null || true)")"
+      [[ -n "$output_now" ]] && printf '路径：%s\n' "$output_now"
+      printf '重新连接后执行：carrot-bag watch %s\n' "$monitor_label"
       trap - INT HUP TERM
-      return 129
+      return 0
     fi
 
     phase=$(state_get phase 2>/dev/null || true)
@@ -303,25 +372,9 @@ monitor_recording() {
   clear_monitor_display
   trap - INT HUP TERM
   if [[ -n "$last_output" ]]; then
-    if [[ -e "$last_output/COMPLETE" && ! -e "$last_output/FAILED" ]]; then
-      result=COMPLETE; verification=通过
-    else
-      result=FAILED; verification=失败
-    fi
-    recorded_seconds=$(sed -n 's/^recorded_seconds=//p' "$last_output/session.txt" 2>/dev/null | tail -1)
-    if [[ "$recorded_seconds" =~ ^[0-9]+$ ]]; then
-      elapsed=$recorded_seconds
-    elif (( last_started > 0 && last_stopped >= last_started )); then
-      elapsed=$((last_stopped - last_started))
-    else
-      now=$(monotonic_seconds); elapsed=0
-      (( last_started > 0 && now >= last_started )) && elapsed=$((now - last_started))
-    fi
-    printf '录制结束：%s\n路径：%s\n累计时长：%s\n自动校验：%s\n' \
-      "$result" "$last_output" "$(format_duration "$elapsed")" "$verification"
-    [[ "$result" == COMPLETE ]]
+    print_run_summary "$last_output" '已完成'
   else
-    fail "recording service stopped before an output directory was created; run: journalctl --user -u $unit -n 50"
+    print_service_failure_summary "$unit" "$monitor_label"
   fi
 }
 
@@ -347,7 +400,8 @@ case "$cmd" in
     printf '%s\n' "$MINUTES" > "$CONTROL_ROOT/duration.${LABEL}"
     if ! systemctl --user start "carrot-bag@${LABEL}.service"; then
       rm -f "$CONTROL_ROOT/duration.${LABEL}"
-      fail 'systemd failed to start the recorder'
+      print_service_failure_summary "carrot-bag@${LABEL}.service" "$LABEL"
+      exit 1
     fi
     if [[ -t 0 && -t 1 ]]; then
       monitor_recording "$LABEL"
@@ -530,13 +584,22 @@ case "$cmd" in
   watch)
     ensure_dirs
     valid_label "$LABEL" || fail 'invalid label'
-    systemctl --user is-active --quiet "carrot-bag@${LABEL}.service" \
-      || fail "no active recording named $LABEL"
-    monitor_recording "$LABEL" ;;
+    if systemctl --user is-active --quiet "carrot-bag@${LABEL}.service"; then
+      monitor_recording "$LABEL"
+    else
+      output=$(latest_output_for_label "$LABEL")
+      [[ -n "$output" ]] || fail "no active or completed recording named $LABEL"
+      print_run_summary "$output" '服务已结束'
+    fi ;;
   status)
     [[ -r "$STATE_FILE" ]] && cat "$STATE_FILE" || echo 'no active recording' ;;
   logs)
-    journalctl --user -u "carrot-bag@${LABEL}.service" -f ;;
+    valid_label "$LABEL" || fail 'invalid label'
+    if systemctl --user is-active --quiet "carrot-bag@${LABEL}.service"; then
+      journalctl --user -u "carrot-bag@${LABEL}.service" -n 50 -f
+    else
+      journalctl --user -u "carrot-bag@${LABEL}.service" -n 100 --no-pager
+    fi ;;
   driver-stop)
     if [[ -r "$STATE_FILE" ]]; then
       active_label=$(state_get label)
