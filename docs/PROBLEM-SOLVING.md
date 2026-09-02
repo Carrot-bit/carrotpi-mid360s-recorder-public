@@ -56,6 +56,21 @@ incorrect topic types, missing messages, out-of-range frequencies, low disk
 space and health failures. Abnormal sessions retain their original directory
 and evidence; existing sessions are never overwritten or resumed.
 
+## Mobile terminal interface
+
+On an interactive SSH terminal, `carrot-bag start <label>` starts the systemd
+service and enters the two-line foreground display. `watch <label>` is only for
+reattaching after that display exits. Closing SSH or receiving `SIGHUP` detaches
+the display without stopping the recorder; `Ctrl+C` requests a safe stop and
+waits for flush and verification. Only one display may attach to a recording,
+which prevents duplicate extension prompts.
+
+The display uses ANSI whole-line clearing and switches to compact text on narrow
+terminals. Set a normal terminal type such as `xterm-256color` for colored status;
+with `TERM=dumb` or `NO_COLOR`, load uses `[低]`, `[中]` and `[高]`. GNU awk
+reserves `load` as a built-in name, so scripts must use a different variable name
+such as `load_value` when calculating normalized load.
+
 ## Common service checks
 
 ```bash

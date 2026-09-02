@@ -1,7 +1,8 @@
 # carrot-profile: auto
 # Generate this locally with: sudo carrot-net create-auto
-# It combines the existing protected home.yaml and field.yaml profiles.
-# The field hotspot receives a higher NetworkManager autoconnect priority.
+# It combines the existing protected home.yaml and field.yaml profiles, plus
+# optional fallback.yaml. The hotspot, home Wi-Fi, and fallback receive
+# NetworkManager autoconnect priorities 100, 10, and 5 respectively.
 network:
   version: 2
   renderer: NetworkManager

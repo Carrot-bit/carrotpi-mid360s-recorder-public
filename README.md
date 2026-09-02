@@ -8,6 +8,7 @@
 - 外接 NTFS 磁盘保护：按 UUID、挂载状态、读写能力和剩余空间拒绝错误录制；不回退写 SD 卡。
 - 受管 Livox 驱动生命周期：录包时自动启动，停止录包后保持运行。
 - `systemd --user` 录包服务，SSH 断开不会中断录制。
+- 交互式 `start` 自动进入适配手机终端的两行动态界面，`watch` 用于断线后重连。
 - LiDAR/IMU 话题类型、实时频率、磁盘、温度、电源和网卡健康检查。
 - 单个 SQLite3 bag、完成/失败标记、相对 SHA-256 清单和诊断证据。
 - 家用 Wi-Fi、手机热点和雷达有线链路的网络模板。
@@ -25,13 +26,14 @@
 ## 常用命令
 
 ```bash
-carrot-bag start experiment01     # 默认 60 分钟
-carrot-bag watch experiment01    # 可选监控
+carrot-bag start experiment01     # 默认 60 分钟并进入前台界面
+carrot-bag watch experiment01    # 仅在前台意外退出后重连
 carrot-bag status
 carrot-bag stop
 carrot-bag logs experiment01
 carrot-bag driver-stop
 carrot-net status
+sudo carrot-net add-fallback "SSID"
 ```
 
 输出目录格式为：

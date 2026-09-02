@@ -7,17 +7,35 @@ CONNECTIONS=${CARROT_NM_CONNECTIONS:-/run/NetworkManager/system-connections}
 [[ -r "$ACTIVE" ]] || exit 0
 grep -qx '# carrot-profile: auto' "$ACTIVE" || exit 0
 hotspot=$(sed -n 's/^# carrot-hotspot-ssid: //p' "$ACTIVE")
-[[ -n "$hotspot" ]] || { echo 'auto network profile has no hotspot marker' >&2; exit 1; }
+home=$(sed -n 's/^# carrot-home-ssid: //p' "$ACTIVE")
+fallback=$(sed -n 's/^# carrot-fallback-ssid: //p' "$ACTIVE")
+[[ -n "$hotspot" && -n "$home" ]] || {
+  echo 'auto network profile has incomplete priority markers' >&2
+  exit 1
+}
+
+declare -A priority=(
+  ["$hotspot"]=100
+  ["$home"]=10
+)
+expected=2
+if [[ -n "$fallback" ]]; then
+  priority["$fallback"]=5
+  expected=3
+fi
 
 found=0
 for profile in "$CONNECTIONS"/netplan-wlan0-*.nmconnection; do
   [[ -f "$profile" ]] || continue
   ssid=$(sed -n 's/^ssid=//p' "$profile" | head -1)
   [[ -n "$ssid" ]] || continue
-  priority=10
-  [[ "$ssid" == "$hotspot" ]] && priority=100
+  [[ -v "priority[$ssid]" ]] || {
+    echo 'auto network profile produced an unexpected Wi-Fi connection' >&2
+    exit 1
+  }
+  connection_priority=${priority[$ssid]}
   temporary=$(mktemp "${profile}.XXXXXX")
-  awk -v priority="$priority" '
+  awk -v priority="$connection_priority" '
     BEGIN { in_connection = 0; wrote = 0 }
     $0 == "[connection]" { in_connection = 1 }
     in_connection && /^autoconnect-priority=/ {
@@ -38,7 +56,7 @@ for profile in "$CONNECTIONS"/netplan-wlan0-*.nmconnection; do
   found=$((found + 1))
 done
 
-(( found == 2 )) || {
-  echo "auto network profile: expected 2 generated Wi-Fi connections, found $found" >&2
+(( found == expected )) || {
+  echo "auto network profile: expected $expected generated Wi-Fi connections, found $found" >&2
   exit 1
 }

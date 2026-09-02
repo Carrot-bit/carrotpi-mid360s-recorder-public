@@ -2,7 +2,14 @@
 set -euo pipefail
 BASE=/etc/carrot-net
 ACTIVE=/etc/netplan/99-carrot.yaml
-usage() { printf 'Usage: sudo carrot-net create-auto | select home|field|auto|rescue | status\n'; }
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  sudo carrot-net add-fallback <SSID>' \
+    '  sudo carrot-net create-auto' \
+    '  sudo carrot-net select home|field|auto|rescue' \
+    '  sudo carrot-net status'
+}
 [[ $EUID -eq 0 ]] || { echo 'run with sudo' >&2; exit 2; }
 print_redacted_netplan() {
   netplan get all 2>/dev/null \
@@ -18,6 +25,60 @@ ensure_exclusive_netplan() {
   done
 }
 case "${1:-}" in
+  add-fallback)
+    ssid=${2:-}
+    [[ -n "$ssid" && $# -eq 2 ]] || { usage; exit 2; }
+    [[ "$ssid" != *$'\n'* && "$ssid" != *$'\r'* && "$ssid" != REPLACE_* ]] || {
+      echo 'invalid fallback SSID' >&2
+      exit 2
+    }
+    [[ ! -e "$BASE/fallback.yaml" ]] || {
+      echo 'fallback profile already exists; remove it locally before replacing it' >&2
+      exit 1
+    }
+    CARROT_NET_FALLBACK_SSID="$ssid" python3 - <<'PY'
+import copy
+import getpass
+import os
+import sys
+import tempfile
+
+import yaml
+
+base = os.environ.get('CARROT_NET_BASE', '/etc/carrot-net')
+ssid = os.environ['CARROT_NET_FALLBACK_SSID']
+path = os.path.join(base, 'fallback.yaml')
+
+try:
+    password = getpass.getpass(f'Password for Wi-Fi "{ssid}": ')
+    if not password:
+        raise ValueError('password must not be empty')
+    with open(os.path.join(base, 'field.yaml'), encoding='utf-8') as stream:
+        profile = yaml.safe_load(stream)
+    profile['network']['wifis']['wlan0']['access-points'] = {
+        ssid: {'password': password},
+    }
+    rendered = '# carrot-profile: fallback\n'
+    rendered += yaml.safe_dump(profile, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    fd, temporary = tempfile.mkstemp(prefix='.fallback.yaml.', dir=base)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as error:
+    print(f'cannot add fallback profile: {error}', file=sys.stderr)
+    sys.exit(1)
+PY
+    printf 'Added protected fallback profile. Run create-auto, select auto, then reboot to apply it.\n' ;;
   create-auto)
     python3 - <<'PY'
 import copy
@@ -42,17 +103,31 @@ try:
         raise ValueError('each source profile must contain exactly one Wi-Fi access point')
     home_ssid = next(iter(home_aps))
     hotspot_ssid = next(iter(field_aps))
-    if home_ssid == hotspot_ssid:
-        raise ValueError('home Wi-Fi and hotspot SSIDs must differ')
-    if 'REPLACE_' in home_ssid or 'REPLACE_' in hotspot_ssid:
+    profiles = [(home_ssid, home_aps[home_ssid]), (hotspot_ssid, field_aps[hotspot_ssid])]
+    fallback_path = os.path.join(base, 'fallback.yaml')
+    fallback_ssid = None
+    if os.path.exists(fallback_path):
+        fallback = load_profile('fallback.yaml')
+        fallback_aps = fallback['network']['wifis']['wlan0']['access-points']
+        if len(fallback_aps) != 1:
+            raise ValueError('fallback profile must contain exactly one Wi-Fi access point')
+        fallback_ssid = next(iter(fallback_aps))
+        profiles.append((fallback_ssid, fallback_aps[fallback_ssid]))
+    ssids = [ssid for ssid, _ in profiles]
+    if len(set(ssids)) != len(ssids):
+        raise ValueError('home Wi-Fi, hotspot, and fallback SSIDs must differ')
+    if any('REPLACE_' in ssid for ssid in ssids):
         raise ValueError('source profile still contains a placeholder')
     auto = copy.deepcopy(field)
     network = auto['network']
     network['wifis']['wlan0']['access-points'] = {
-        home_ssid: copy.deepcopy(home_aps[home_ssid]),
-        hotspot_ssid: copy.deepcopy(field_aps[hotspot_ssid]),
+        ssid: copy.deepcopy(access_point) for ssid, access_point in profiles
     }
-    rendered = '# carrot-profile: auto\n# carrot-hotspot-ssid: ' + hotspot_ssid + '\n'
+    rendered = '# carrot-profile: auto\n'
+    rendered += '# carrot-hotspot-ssid: ' + hotspot_ssid + '\n'
+    rendered += '# carrot-home-ssid: ' + home_ssid + '\n'
+    if fallback_ssid is not None:
+        rendered += '# carrot-fallback-ssid: ' + fallback_ssid + '\n'
     rendered += yaml.safe_dump(auto, allow_unicode=True, default_flow_style=False, sort_keys=False)
     fd, temporary = tempfile.mkstemp(prefix='.auto.yaml.', dir=base)
     try:
