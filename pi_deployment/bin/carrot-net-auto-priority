@@ -36,20 +36,30 @@ for profile in "$CONNECTIONS"/netplan-wlan0-*.nmconnection; do
   connection_priority=${priority[$ssid]}
   temporary=$(mktemp "${profile}.XXXXXX")
   awk -v priority="$connection_priority" '
-    BEGIN { in_connection = 0; wrote = 0 }
+    BEGIN { in_connection = 0; wrote = 0; wrote_retries = 0 }
     $0 == "[connection]" { in_connection = 1 }
     in_connection && /^autoconnect-priority=/ {
       print "autoconnect-priority=" priority
       wrote = 1
       next
     }
+    in_connection && /^autoconnect-retries=/ {
+      print "autoconnect-retries=1"
+      wrote_retries = 1
+      next
+    }
     in_connection && /^\[/ && $0 != "[connection]" {
       if (!wrote) print "autoconnect-priority=" priority
+      if (!wrote_retries) print "autoconnect-retries=1"
       in_connection = 0
       wrote = 1
+      wrote_retries = 1
     }
     { print }
-    END { if (in_connection && !wrote) print "autoconnect-priority=" priority }
+    END {
+      if (in_connection && !wrote) print "autoconnect-priority=" priority
+      if (in_connection && !wrote_retries) print "autoconnect-retries=1"
+    }
   ' "$profile" > "$temporary"
   chmod 600 "$temporary"
   mv -f "$temporary" "$profile"
@@ -60,3 +70,7 @@ done
   echo "auto network profile: expected $expected generated Wi-Fi connections, found $found" >&2
   exit 1
 }
+
+# NetworkManager keeps connection settings in memory; reload after editing the
+# generated keyfiles so the retry policy applies without a reboot.
+nmcli connection reload

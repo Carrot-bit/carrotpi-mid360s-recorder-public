@@ -71,6 +71,10 @@ with `TERM=dumb` or `NO_COLOR`, load uses `[低]`, `[中]` and `[高]`. GNU awk
 reserves `load` as a built-in name, so scripts must use a different variable name
 such as `load_value` when calculating normalized load.
 
+Automatic Wi-Fi profiles use a single activation retry so a failed higher-priority
+hotspot quickly yields to the next available profile. A newly available hotspot
+does not preempt an already connected lower-priority network.
+
 ## Common service checks
 
 ```bash
